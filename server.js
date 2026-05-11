@@ -1,6 +1,9 @@
 /**
  * server.js — FirmeRO API Backend (Railway)
  * Proxy complet pentru ANAF — rezolvă CORS și accesul din file://
+ * Integrează:
+ *   - ANAF v9 (date TVA, bilanțuri) — gratuit
+ *   - FirmeAPI.ro (detalii ONRC, administratori) — cheie API
  */
 
 import express from 'express';
@@ -14,6 +17,14 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const ANAF_TVA_URL = 'https://webservicesp.anaf.ro/api/PlatitorTvaRest/v9/tva';
 const ANAF_BILANT_URL = 'https://webservicesp.anaf.ro/bilant';
+
+// FirmeAPI.ro — date ONRC (administratori, detalii extinse)
+const FIRMEAPI_KEY = process.env.FIRMEAPI_KEY || '';
+const FIRMEAPI_BASE = 'https://www.firmeapi.ro/api/v1';
+const FIRMEAPI_HEADERS = {
+  'Accept': 'application/json',
+  'Authorization': `Bearer ${FIRMEAPI_KEY}`
+};
 
 // Agent HTTPS cu keepAlive pentru performanță
 const httpsAgent = new https.Agent({ keepAlive: true, rejectUnauthorized: false });
@@ -68,7 +79,13 @@ function cacheSet(key, val, ttlMs) {
 
 // ── HEALTH CHECK ─────────────────────────────────────────
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', uptime: Math.round(process.uptime()), cacheSize: cache.size, version: '2.0' });
+  res.json({
+    status: 'ok',
+    uptime: Math.round(process.uptime()),
+    cacheSize: cache.size,
+    version: '3.0',
+    firmeapi: FIRMEAPI_KEY ? 'configured' : 'not_configured'
+  });
 });
 
 // ── PROXY ANAF TVA → GET /api/firma/:cui ─────────────────
@@ -233,6 +250,62 @@ app.get('/api/search', async (req, res) => {
   }
   cacheSet(cKey, hits, 300_000);
   return res.json({ source: 'cache', data: hits });
+});
+
+// ── PROXY FirmeAPI.ro DETALII → GET /api/detalii/:cui ────
+app.get('/api/detalii/:cui', async (req, res) => {
+  const cui = req.params.cui.replace(/\D/g, '');
+  if (!cui || cui.length < 4) return res.status(400).json({ error: 'CUI invalid' });
+  if (!FIRMEAPI_KEY) return res.status(503).json({ error: 'FirmeAPI nu este configurat.' });
+
+  const cKey = `fd_${cui}`;
+  const cached = cacheGet(cKey);
+  if (cached) return res.json({ source: 'cache', data: cached });
+
+  try {
+    const r = await fetch(`${FIRMEAPI_BASE}/firma/${cui}`, {
+      headers: FIRMEAPI_HEADERS,
+      signal: AbortSignal.timeout(10000)
+    });
+    const json = await r.json();
+    if (json.success && json.data) {
+      cacheSet(cKey, json.data, 3600_000); // 1h
+      return res.json({ source: 'firmeapi', data: json.data });
+    }
+    console.log(`FirmeAPI detalii error:`, json.error || json.message);
+    return res.status(r.status || 502).json({ error: json.error || json.message || 'Eroare FirmeAPI' });
+  } catch (e) {
+    console.log(`FirmeAPI detalii fetch error: ${e.message}`);
+    return res.status(502).json({ error: 'FirmeAPI indisponibil momentan.' });
+  }
+});
+
+// ── PROXY FirmeAPI.ro ADMINISTRATORI → GET /api/administratori/:cui ──
+app.get('/api/administratori/:cui', async (req, res) => {
+  const cui = req.params.cui.replace(/\D/g, '');
+  if (!cui || cui.length < 4) return res.status(400).json({ error: 'CUI invalid' });
+  if (!FIRMEAPI_KEY) return res.status(503).json({ error: 'FirmeAPI nu este configurat.' });
+
+  const cKey = `fa_${cui}`;
+  const cached = cacheGet(cKey);
+  if (cached) return res.json({ source: 'cache', data: cached });
+
+  try {
+    const r = await fetch(`${FIRMEAPI_BASE}/administratori/${cui}`, {
+      headers: FIRMEAPI_HEADERS,
+      signal: AbortSignal.timeout(10000)
+    });
+    const json = await r.json();
+    if (json.success && json.data) {
+      cacheSet(cKey, json.data, 21600_000); // 6h — admins se schimbă rar
+      return res.json({ source: 'firmeapi', data: json.data });
+    }
+    console.log(`FirmeAPI admin error:`, json.error || json.message);
+    return res.status(r.status || 502).json({ error: json.error || json.message || 'Eroare FirmeAPI' });
+  } catch (e) {
+    console.log(`FirmeAPI admin fetch error: ${e.message}`);
+    return res.status(502).json({ error: 'FirmeAPI indisponibil momentan.' });
+  }
 });
 
 // ── UTILS ────────────────────────────────────────────────
