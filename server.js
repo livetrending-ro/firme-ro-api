@@ -12,6 +12,9 @@ import compression from 'compression';
 import rateLimit from 'express-rate-limit';
 import fetch from 'node-fetch';
 import https from 'https';
+import pg from 'pg';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -305,6 +308,145 @@ app.get('/api/administratori/:cui', async (req, res) => {
   } catch (e) {
     console.log(`FirmeAPI admin fetch error: ${e.message}`);
     return res.status(502).json({ error: 'FirmeAPI indisponibil momentan.' });
+  }
+});
+
+// ── AUTH & BAZĂ DE DATE ──────────────────────────────────
+const { Pool } = pg;
+const JWT_SECRET = process.env.JWT_SECRET || 'firme-ro-secret-key';
+let pool = null;
+
+if (process.env.DATABASE_URL) {
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+  });
+
+  // Inițializare tabele
+  pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      email VARCHAR(255) UNIQUE NOT NULL,
+      password_hash VARCHAR(255) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS favorites (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      cui VARCHAR(20) NOT NULL,
+      denumire VARCHAR(255),
+      notita TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, cui)
+    );
+  `).then(() => console.log('✅ PostgreSQL inițializat')).catch(err => console.error('Eroare DB:', err.message));
+}
+
+// Middleware autentificare
+function authenticateToken(req, res, next) {
+  if (!pool) return res.status(503).json({ error: 'Baza de date nu este configurată.' });
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Acces neautorizat. Lipsă token.' });
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ error: 'Token invalid sau expirat.' });
+    req.user = user;
+    next();
+  });
+}
+
+// Înregistrare
+app.post('/api/auth/register', async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Baza de date nu este configurată.' });
+  try {
+    const { email, password } = req.body;
+    if (!email || !password || password.length < 6) 
+      return res.status(400).json({ error: 'Date invalide. Parola trebuie să aibă minim 6 caractere.' });
+    
+    const hash = await bcrypt.hash(password, 10);
+    const result = await pool.query('INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email', [email, hash]);
+    
+    const token = jwt.sign({ id: result.rows[0].id, email }, JWT_SECRET, { expiresIn: '7d' });
+    res.status(201).json({ token, user: result.rows[0] });
+  } catch (err) {
+    if (err.code === '23505') return res.status(400).json({ error: 'Acest email este deja înregistrat.' });
+    res.status(500).json({ error: 'Eroare la înregistrare.' });
+  }
+});
+
+// Autentificare
+app.post('/api/auth/login', async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Baza de date nu este configurată.' });
+  try {
+    const { email, password } = req.body;
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (result.rows.length === 0) return res.status(400).json({ error: 'Email sau parolă incorectă.' });
+    
+    const user = result.rows[0];
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) return res.status(400).json({ error: 'Email sau parolă incorectă.' });
+    
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: { id: user.id, email: user.email } });
+  } catch (err) {
+    res.status(500).json({ error: 'Eroare la autentificare.' });
+  }
+});
+
+// GET Favorite
+app.get('/api/favorites', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM favorites WHERE user_id = $1 ORDER BY created_at DESC', [req.user.id]);
+    res.json({ data: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Eroare la obținerea favoritelor.' });
+  }
+});
+
+// POST Favorite
+app.post('/api/favorites', authenticateToken, async (req, res) => {
+  try {
+    const { cui, denumire, notita } = req.body;
+    
+    const count = await pool.query('SELECT COUNT(*) FROM favorites WHERE user_id = $1', [req.user.id]);
+    if (parseInt(count.rows[0].count) >= 20) {
+      return res.status(400).json({ error: 'Ai atins limita maximă de 20 de firme favorite.' });
+    }
+    
+    const result = await pool.query(
+      'INSERT INTO favorites (user_id, cui, denumire, notita) VALUES ($1, $2, $3, $4) ON CONFLICT (user_id, cui) DO NOTHING RETURNING *',
+      [req.user.id, cui, denumire, notita || '']
+    );
+    if (result.rows.length === 0) return res.status(400).json({ error: 'Firma este deja în favorite.' });
+    res.status(201).json({ data: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'Eroare la salvarea firmei.' });
+  }
+});
+
+// PUT Notiță
+app.put('/api/favorites/:id', authenticateToken, async (req, res) => {
+  try {
+    const { notita } = req.body;
+    const result = await pool.query(
+      'UPDATE favorites SET notita = $1 WHERE id = $2 AND user_id = $3 RETURNING *',
+      [notita, req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Firmă negăsită.' });
+    res.json({ data: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'Eroare la actualizare.' });
+  }
+});
+
+// DELETE Favorite
+app.delete('/api/favorites/:id', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM favorites WHERE id = $1 AND user_id = $2 RETURNING id', [req.params.id, req.user.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Firmă negăsită.' });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Eroare la ștergere.' });
   }
 });
 
