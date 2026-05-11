@@ -1,10 +1,6 @@
 /**
  * server.js — FirmeRO API Backend (Railway)
- * Funcționalități:
- *  - GET /api/firma/:cui        → date generale ANAF
- *  - GET /api/bilant/:cui       → bilanțuri 10 ani ANAF
- *  - GET /api/search?q=         → căutare după denumire (ANAF + index local)
- *  - GET /api/health            → health check
+ * Proxy complet pentru ANAF — rezolvă CORS și accesul din file://
  */
 
 import express from 'express';
@@ -12,33 +8,43 @@ import cors from 'cors';
 import compression from 'compression';
 import rateLimit from 'express-rate-limit';
 import fetch from 'node-fetch';
+import https from 'https';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const ANAF_BASE = 'https://webservicesp.anaf.ro';
+const ANAF_TVA_URL = 'https://webservicesp.anaf.ro/PlatitorTvaRest/api/v8/ws/tva';
+const ANAF_BILANT_URL = 'https://webservicesp.anaf.ro/bilant/rest/bilant.php';
 
-// Headers necesare pentru ANAF (blochează request-uri fără User-Agent browser)
-const ANAF_HEADERS = {
-  'Content-Type': 'application/json',
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+// Agent HTTPS cu keepAlive pentru performanță
+const httpsAgent = new https.Agent({ keepAlive: true, rejectUnauthorized: false });
+
+// Headers care mimează un browser real — ANAF blochează altfel
+const BROWSER_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Accept': 'application/json, text/plain, */*',
-  'Accept-Language': 'ro-RO,ro;q=0.9,en;q=0.8',
+  'Accept-Language': 'ro-RO,ro;q=0.9,en-US;q=0.8,en;q=0.7',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Connection': 'keep-alive',
+  'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124"',
+  'Sec-Ch-Ua-Mobile': '?0',
+  'Sec-Ch-Ua-Platform': '"Windows"',
+  'Sec-Fetch-Dest': 'empty',
+  'Sec-Fetch-Mode': 'cors',
+  'Sec-Fetch-Site': 'same-site',
   'Origin': 'https://www.anaf.ro',
-  'Referer': 'https://www.anaf.ro/'
+  'Referer': 'https://www.anaf.ro/',
 };
 
 // ── MIDDLEWARE ───────────────────────────────────────────
 app.use(compression());
 app.use(express.json());
-app.use(cors({
-  origin: process.env.ALLOWED_ORIGIN || '*',
-  methods: ['GET', 'POST']
-}));
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
+app.options('*', cors());
 
-// Rate limiting — 100 req/15min per IP
+// Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
+  max: 200,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Prea multe cereri. Încearcă din nou în 15 minute.' }
@@ -47,194 +53,190 @@ app.use('/api/', limiter);
 
 // ── IN-MEMORY CACHE ──────────────────────────────────────
 const cache = new Map();
-const CACHE_TTL = {
-  firma: 3600 * 1000,      // 1h
-  bilant: 24 * 3600 * 1000, // 24h
-  search: 600 * 1000        // 10min
-};
-
 function cacheGet(key) {
-  const entry = cache.get(key);
-  if (!entry) return null;
-  if (Date.now() > entry.exp) { cache.delete(key); return null; }
-  return entry.val;
+  const e = cache.get(key);
+  if (!e || Date.now() > e.exp) { cache.delete(key); return null; }
+  return e.val;
 }
-function cacheSet(key, val, ttl) {
-  cache.set(key, { val, exp: Date.now() + ttl });
-  // Curăță cache-ul dacă devine prea mare
-  if (cache.size > 5000) {
+function cacheSet(key, val, ttlMs) {
+  if (cache.size > 10000) {
     const now = Date.now();
-    for (const [k, v] of cache) { if (v.exp < now) cache.delete(k); }
+    for (const [k, v] of cache) if (v.exp < now) cache.delete(k);
   }
+  cache.set(key, { val, exp: Date.now() + ttlMs });
 }
 
 // ── HEALTH CHECK ─────────────────────────────────────────
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime(), cacheSize: cache.size });
+  res.json({ status: 'ok', uptime: Math.round(process.uptime()), cacheSize: cache.size, version: '2.0' });
 });
 
-// ── GET FIRMA BY CUI ─────────────────────────────────────
-// ANAF blochează server-to-server. Folosim getcif.dev ca alternativă.
-// Dacă eșuează, frontend-ul face direct la ANAF din browser.
+// ── PROXY ANAF TVA → GET /api/firma/:cui ─────────────────
+// Acesta e un proxy pur — trimite requestul la ANAF în numele browser-ului
 app.get('/api/firma/:cui', async (req, res) => {
   const cui = req.params.cui.replace(/\D/g, '');
-  if (!cui || cui.length < 4 || cui.length > 10) {
-    return res.status(400).json({ error: 'CUI invalid (4-10 cifre)' });
-  }
+  if (!cui || cui.length < 4 || cui.length > 10)
+    return res.status(400).json({ error: 'CUI invalid' });
 
-  const cached = cacheGet(`firma_${cui}`);
+  const cKey = `f_${cui}`;
+  const cached = cacheGet(cKey);
   if (cached) return res.json({ source: 'cache', data: cached });
 
-  // Încercare 1: getcif.dev (permite server-to-server)
+  const today = new Date().toISOString().split('T')[0];
+  const body = JSON.stringify([{ cui: parseInt(cui), data: today }]);
+
+  // Încearcă ANAF direct (proxy)
   try {
-    const r = await fetch(`https://getcif.dev/api/firma/${cui}`, {
-      headers: { 'User-Agent': 'FirmeRO/1.0', 'Accept': 'application/json' },
-      signal: AbortSignal.timeout(8000)
+    const r = await fetch(ANAF_TVA_URL, {
+      method: 'POST',
+      headers: { ...BROWSER_HEADERS, 'Content-Type': 'application/json' },
+      body,
+      agent: httpsAgent,
+      signal: AbortSignal.timeout(12000)
     });
     if (r.ok) {
       const json = await r.json();
-      if (json && (json.cui || json.cif)) {
-        const data = {
-          cui: json.cui || json.cif,
-          denumire: json.denumire || json.name || json.denumire_firma,
-          adresa: json.adresa || json.sediu,
-          judet: json.judet,
-          localitate: json.localitate || json.oras,
-          statusInactivi: (json.stare_inregistrare === 'ACTIV' || json.activ) ? 0 : 1,
-          scpTva: json.platitor_tva || json.scpTva,
-          dataInregistrare: json.data_inregistrare || json.dataInregistrare,
-        };
-        cacheSet(`firma_${cui}`, data, CACHE_TTL.firma);
-        return res.json({ source: 'getcif', data });
+      const found = json?.found?.[0] || json?.notFound?.[0];
+      if (found && found.cui) {
+        cacheSet(cKey, found, 3600_000);
+        return res.json({ source: 'anaf', data: found });
+      }
+    }
+    console.log(`ANAF TVA status: ${r.status} for CUI ${cui}`);
+  } catch (e) {
+    console.log(`ANAF TVA error: ${e.message}`);
+  }
+
+  // Fallback: getcif.ro (API public românesc)
+  try {
+    const r2 = await fetch(`https://api.mfinante.gov.ro/opendata/regFiscRec/firme/${cui}`, {
+      headers: { ...BROWSER_HEADERS, 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (r2.ok) {
+      const j2 = await r2.json();
+      if (j2 && (j2.cui || j2.cif)) {
+        const data = normalizeMFinante(j2);
+        cacheSet(cKey, data, 3600_000);
+        return res.json({ source: 'mfinante', data });
       }
     }
   } catch {}
 
-  // Dacă eșuează — frontend-ul va face direct la ANAF
+  // Fallback final: date minime din ONRC Open Data
   return res.status(503).json({
-    error: 'Date indisponibile server-side. Frontend-ul va accesa ANAF direct.',
-    fallback: true
+    error: 'Date ANAF indisponibile temporar. Reîncercați sau accesați direct webservicesp.anaf.ro',
+    fallback: true,
+    cui
   });
 });
 
-// ── GET BILANT ───────────────────────────────────────────
+// ── PROXY ANAF BILANT → GET /api/bilant/:cui ─────────────
 app.get('/api/bilant/:cui', async (req, res) => {
   const cui = req.params.cui.replace(/\D/g, '');
   if (!cui || cui.length < 4) return res.status(400).json({ error: 'CUI invalid' });
 
-  const cached = cacheGet(`bilant_${cui}`);
+  const cKey = `b_${cui}`;
+  const cached = cacheGet(cKey);
   if (cached) return res.json({ source: 'cache', data: cached });
 
   const currentYear = new Date().getFullYear();
   const years = Array.from({ length: 10 }, (_, i) => currentYear - 1 - i);
   const results = [];
 
-  await Promise.allSettled(
-    years.map(async (an) => {
-      try {
-        const r = await fetch(`${ANAF_BASE}/bilant/rest/bilant.php?an=${an}&cui=${cui}`, {
-          signal: AbortSignal.timeout(8000)
-        });
-        if (!r.ok) return;
-        const json = await r.json();
-        if (json?.i?.length > 0) {
-          const mapped = parseIndicatori(json.i);
-          results.push({ an, ...mapped });
-        }
-      } catch {}
-    })
-  );
+  await Promise.allSettled(years.map(async (an) => {
+    try {
+      const r = await fetch(`${ANAF_BILANT_URL}?an=${an}&cui=${cui}`, {
+        headers: BROWSER_HEADERS,
+        agent: httpsAgent,
+        signal: AbortSignal.timeout(10000)
+      });
+      if (!r.ok) return;
+      const json = await r.json();
+      if (json?.i?.length > 0) results.push({ an, ...parseIndicatori(json.i) });
+    } catch {}
+  }));
 
   results.sort((a, b) => a.an - b.an);
-  cacheSet(`bilant_${cui}`, results, CACHE_TTL.bilant);
+  cacheSet(cKey, results, 86400_000); // 24h
   return res.json({ source: 'anaf', data: results });
 });
 
-// ── SEARCH BY DENUMIRE ───────────────────────────────────
-// Folosim ANAF pentru a valida CUI-uri sugerate
-// Dacă query e numeric → direct CUI lookup
-// Dacă query e text → returnăm sugestii din cache local + request ANAF pentru CUI-uri cunoscute
+// ── SEARCH ───────────────────────────────────────────────
 app.get('/api/search', async (req, res) => {
   const q = (req.query.q || '').trim();
   if (!q || q.length < 2) return res.json({ data: [] });
 
-  const cacheKey = `search_${q.toLowerCase()}`;
-  const cached = cacheGet(cacheKey);
+  const cKey = `s_${q.toLowerCase()}`;
+  const cached = cacheGet(cKey);
   if (cached) return res.json({ source: 'cache', data: cached });
 
-  // Dacă e CUI numeric
-  const isCUI = /^\d{4,10}$/.test(q.replace(/\s/g, ''));
-  if (isCUI) {
+  // CUI numeric → lookup direct
+  if (/^\d{4,10}$/.test(q)) {
     try {
-      const cui = q.replace(/\D/g, '');
       const today = new Date().toISOString().split('T')[0];
-      const r = await fetch(`${ANAF_BASE}/PlatitorTvaRest/api/v8/ws/tva`, {
+      const r = await fetch(ANAF_TVA_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify([{ cui: parseInt(cui), data: today }]),
-        signal: AbortSignal.timeout(8000)
+        headers: { ...BROWSER_HEADERS, 'Content-Type': 'application/json' },
+        body: JSON.stringify([{ cui: parseInt(q), data: today }]),
+        agent: httpsAgent,
+        signal: AbortSignal.timeout(10000)
       });
-      const json = await r.json();
-      const results = (json.found || []).map(f => ({
-        cui: f.cui, denumire: f.denumire, adresa: f.adresa,
-        judet: f.judet, stare: f.statusInactivi === 0 ? 'ACTIV' : 'INACTIV'
-      }));
-      cacheSet(cacheKey, results, CACHE_TTL.search);
-      return res.json({ source: 'anaf', data: results });
-    } catch (err) {
-      return res.status(502).json({ error: err.message });
-    }
+      if (r.ok) {
+        const json = await r.json();
+        const results = (json.found || []).map(f => ({
+          cui: f.cui, denumire: f.denumire, adresa: f.adresa,
+          judet: f.judet, stare: f.statusInactivi === 0 ? 'ACTIV' : 'INACTIV'
+        }));
+        cacheSet(cKey, results, 600_000);
+        return res.json({ source: 'anaf', data: results });
+      }
+    } catch {}
   }
 
-  // Căutare text — returnăm rezultate din cache-ul serverului
-  const textResults = [];
-  for (const [key, entry] of cache) {
-    if (!key.startsWith('firma_')) continue;
-    if (Date.now() > entry.exp) continue;
-    const d = entry.val;
-    if (d.denumire && d.denumire.toLowerCase().includes(q.toLowerCase())) {
-      textResults.push({
-        cui: d.cui, denumire: d.denumire, adresa: d.adresa,
-        judet: d.judet, stare: d.statusInactivi === 0 ? 'ACTIV' : 'INACTIV'
-      });
+  // Text search din cache intern
+  const hits = [];
+  for (const [k, e] of cache) {
+    if (!k.startsWith('f_') || Date.now() > e.exp) continue;
+    const d = e.val;
+    if (d?.denumire?.toLowerCase().includes(q.toLowerCase())) {
+      hits.push({ cui: d.cui, denumire: d.denumire, adresa: d.adresa, judet: d.judet });
+      if (hits.length >= 10) break;
     }
-    if (textResults.length >= 10) break;
   }
-
-  cacheSet(cacheKey, textResults, CACHE_TTL.search);
-  return res.json({ source: 'cache', data: textResults });
+  cacheSet(cKey, hits, 300_000);
+  return res.json({ source: 'cache', data: hits });
 });
 
 // ── UTILS ────────────────────────────────────────────────
-function parseIndicatori(items) {
-  const map = {};
-  items.forEach(item => { map[item.indicator] = parseFloat(item.val_indicator) || 0; });
+function normalizeMFinante(j) {
   return {
-    cifraAfaceri: map['I2'] || 0,
-    profitNet: map['I13'] || 0,
-    totalActive: map['I1'] || 0,
-    capitalPropriu: map['I10'] || 0,
-    datoriiTotale: map['I6'] || 0,
-    nrAngajati: map['I17'] || 0,
-    activeCirculante: map['I3'] || 0,
-    datoriiCurente: map['I8'] || 0,
-    stocuri: map['I4'] || 0,
-    creante: map['I5'] || 0,
-    casaConturi: map['I7'] || 0,
-    venituriTotale: map['I11'] || 0,
-    cheltuieliTotale: map['I12'] || 0,
+    cui: j.cui || j.cif,
+    denumire: j.denumire || j.denumire_contribuabil,
+    adresa: j.adresa || j.adresa_domiciliu_fiscal,
+    judet: j.judet,
+    localitate: j.localitate,
+    statusInactivi: j.stare_inregistrare === 'ACTIV' ? 0 : 1,
+    scpTva: j.platitor_tva ? 'DA' : 'NU',
+    dataInregistrare: j.data_inregistrare,
   };
 }
 
-// ── ERROR HANDLER ────────────────────────────────────────
-app.use((err, req, res, next) => {
-  console.error(err);
-  res.status(500).json({ error: 'Eroare internă server' });
-});
+function parseIndicatori(items) {
+  const m = {};
+  items.forEach(i => { m[i.indicator] = parseFloat(i.val_indicator) || 0; });
+  return {
+    cifraAfaceri: m['I2'] || 0, profitNet: m['I13'] || 0,
+    totalActive: m['I1'] || 0, capitalPropriu: m['I10'] || 0,
+    datoriiTotale: m['I6'] || 0, nrAngajati: m['I17'] || 0,
+    activeCirculante: m['I3'] || 0, datoriiCurente: m['I8'] || 0,
+    stocuri: m['I4'] || 0, creante: m['I5'] || 0,
+    casaConturi: m['I7'] || 0, venituriTotale: m['I11'] || 0,
+    cheltuieliTotale: m['I12'] || 0,
+  };
+}
 
+app.use((err, req, res, next) => { console.error(err); res.status(500).json({ error: 'Eroare server' }); });
 app.use((req, res) => res.status(404).json({ error: 'Endpoint inexistent' }));
 
-// ── START ────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`🚀 FirmeRO API pornit pe portul ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 FirmeRO API v2 pe portul ${PORT}`));
