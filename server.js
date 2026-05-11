@@ -509,6 +509,137 @@ function parseIndicatori(items) {
   };
 }
 
+// ==========================================
+// BVB PROXY — Stock data from Bucharest Stock Exchange
+// ==========================================
+
+// In-memory cache for BVB data (15 min TTL)
+const bvbCache = { shares: null, sharesTs: 0, instruments: {} };
+const BVB_CACHE_TTL = 15 * 60 * 1000;
+
+/**
+ * GET /api/bvb/shares — Proxy download of BVB shares CSV
+ * Returns parsed JSON array of all listed shares
+ */
+app.get('/api/bvb/shares', async (req, res) => {
+  try {
+    if (bvbCache.shares && (Date.now() - bvbCache.sharesTs) < BVB_CACHE_TTL) {
+      return res.json({ data: bvbCache.shares, cached: true });
+    }
+
+    const csvUrl = 'https://bvb.ro/FinancialInstruments/Markets/SharesListForDownload.ashx';
+    const response = await fetch(csvUrl, {
+      agent: httpsAgent,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0',
+        'Accept': 'text/csv, text/plain, */*',
+        'Referer': 'https://bvb.ro/FinancialInstruments/Markets/Shares',
+      },
+      timeout: 15000
+    });
+
+    if (!response.ok) throw new Error(`BVB responded with ${response.status}`);
+
+    const text = await response.text();
+    const lines = text.split('\n').filter(l => l.trim());
+    
+    if (lines.length < 2) throw new Error('BVB CSV empty or invalid');
+
+    // Parse CSV — detect separator (could be , or ;)
+    const sep = lines[0].includes(';') ? ';' : ',';
+    const headers = lines[0].split(sep).map(h => h.trim().replace(/"/g, ''));
+    
+    const shares = [];
+    for (let i = 1; i < lines.length; i++) {
+      const cols = lines[i].split(sep).map(c => c.trim().replace(/"/g, ''));
+      if (cols.length < 4) continue;
+      
+      const row = {};
+      headers.forEach((h, idx) => { row[h] = cols[idx] || ''; });
+      shares.push(row);
+    }
+
+    bvbCache.shares = shares;
+    bvbCache.sharesTs = Date.now();
+
+    res.json({ data: shares, count: shares.length });
+  } catch (err) {
+    console.error('BVB shares error:', err.message);
+    res.status(502).json({ error: 'Nu s-au putut prelua datele BVB: ' + err.message });
+  }
+});
+
+/**
+ * GET /api/bvb/instrument/:symbol — Scrape instrument details from BVB page
+ * Returns: price, change, volume, marketCap, 52w range etc.
+ */
+app.get('/api/bvb/instrument/:symbol', async (req, res) => {
+  const symbol = req.params.symbol.toUpperCase();
+  
+  try {
+    // Check cache
+    const cached = bvbCache.instruments[symbol];
+    if (cached && (Date.now() - cached.ts) < BVB_CACHE_TTL) {
+      return res.json({ data: cached.data, cached: true });
+    }
+
+    const url = `https://bvb.ro/FinancialInstruments/Details/FinancialInstrumentsDetails.aspx?s=${symbol}`;
+    const response = await fetch(url, {
+      agent: httpsAgent,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0',
+        'Accept': 'text/html',
+        'Accept-Language': 'ro-RO,ro;q=0.9',
+        'Referer': 'https://bvb.ro/FinancialInstruments/Markets/Shares',
+      },
+      timeout: 15000
+    });
+
+    if (!response.ok) throw new Error(`BVB responded with ${response.status}`);
+
+    const html = await response.text();
+
+    // Parse key values from HTML using regex (BVB uses server-rendered pages)
+    const extract = (pattern) => {
+      const m = html.match(pattern);
+      return m ? m[1].trim().replace(/,/g, '').replace(/\s/g, '') : null;
+    };
+
+    const parseNum = (val) => {
+      if (!val) return 0;
+      return parseFloat(val.replace(/[^\d.\-]/g, '')) || 0;
+    };
+
+    // BVB page structure — extract data from typical patterns
+    const data = {
+      symbol,
+      price: parseNum(extract(/Pret\s*<\/.*?>([\d.,]+)/i) || extract(/class="value"[^>]*>([\d.,]+)/i)),
+      change: parseNum(extract(/Var(?:iatia|iatie|\.)\s*%?\s*<\/.*?>([-\d.,]+)/i)),
+      volume: parseNum(extract(/Volum\s*<\/.*?>([\d.,]+)/i)),
+      marketCap: parseNum(extract(/Capitalizare\s*<\/.*?>([\d.,]+)/i)),
+      high52w: parseNum(extract(/Max(?:im)?\s*52\s*[Ss](?:apt|ăpt)?\s*<\/.*?>([\d.,]+)/i)),
+      low52w: parseNum(extract(/Min(?:im)?\s*52\s*[Ss](?:apt|ăpt)?\s*<\/.*?>([\d.,]+)/i)),
+      open: parseNum(extract(/Deschidere\s*<\/.*?>([\d.,]+)/i)),
+      previousClose: parseNum(extract(/Inchidere\s*(?:ant|prec)?\s*<\/.*?>([\d.,]+)/i)),
+      // Try to extract number of shares
+      shares: parseNum(extract(/Nr\.?\s*(?:de\s*)?actiuni\s*<\/.*?>([\d.,]+)/i) || extract(/Actiuni\s*emise\s*<\/.*?>([\d.,]+)/i)),
+    };
+
+    // If price extraction failed, try broader patterns
+    if (!data.price) {
+      // Look for the main price value on the page (usually prominent)
+      const priceMatch = html.match(/id="[^"]*(?:price|pret|LastPrice)[^"]*"[^>]*>([\d.,]+)/i);
+      if (priceMatch) data.price = parseNum(priceMatch[1]);
+    }
+
+    bvbCache.instruments[symbol] = { data, ts: Date.now() };
+    res.json({ data });
+  } catch (err) {
+    console.error(`BVB instrument ${symbol} error:`, err.message);
+    res.status(502).json({ error: 'Nu s-au putut prelua detaliile instrumentului: ' + err.message });
+  }
+});
+
 app.use((err, req, res, next) => { console.error(err); res.status(500).json({ error: 'Eroare server' }); });
 app.use((req, res) => res.status(404).json({ error: 'Endpoint inexistent' }));
 
