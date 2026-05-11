@@ -12,8 +12,8 @@ import https from 'https';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const ANAF_TVA_URL = 'https://webservicesp.anaf.ro/PlatitorTvaRest/api/v8/ws/tva';
-const ANAF_BILANT_URL = 'https://webservicesp.anaf.ro/bilant/rest/bilant.php';
+const ANAF_TVA_URL = 'https://webservicesp.anaf.ro/api/PlatitorTvaRest/v9/tva';
+const ANAF_BILANT_URL = 'https://webservicesp.anaf.ro/bilant';
 
 // Agent HTTPS cu keepAlive pentru performanță
 const httpsAgent = new https.Agent({ keepAlive: true, rejectUnauthorized: false });
@@ -96,10 +96,23 @@ app.get('/api/firma/:cui', async (req, res) => {
     });
     if (r.ok) {
       const json = await r.json();
-      const found = json?.found?.[0] || json?.notFound?.[0];
-      if (found && found.cui) {
-        cacheSet(cKey, found, 3600_000);
-        return res.json({ source: 'anaf', data: found });
+      const f = json?.found?.[0];
+      if (f && f.date_generale && f.date_generale.cui) {
+        const mapped = {
+          cui: f.date_generale.cui,
+          denumire: f.date_generale.denumire,
+          adresa: f.date_generale.adresa,
+          judet: f.adresa_sediu_social?.sdenumire_Judet || '',
+          localitate: f.adresa_sediu_social?.sdenumire_Localitate || '',
+          statusInactivi: f.stare_inactiv?.statusInactivi ? 1 : 0,
+          scpTva: f.inregistrare_scop_Tva?.scpTVA ? 'DA' : 'NU',
+          dataInregistrare: f.date_generale.data_inregistrare,
+          stare_inregistrare: f.date_generale.stare_inregistrare,
+          telefon: f.date_generale.telefon,
+          codCaen: f.date_generale.cod_CAEN
+        };
+        cacheSet(cKey, mapped, 3600_000);
+        return res.json({ source: 'anaf', data: mapped });
       }
     }
     console.log(`ANAF TVA status: ${r.status} for CUI ${cui}`);
@@ -184,10 +197,18 @@ app.get('/api/search', async (req, res) => {
       });
       if (r.ok) {
         const json = await r.json();
-        const results = (json.found || []).map(f => ({
-          cui: f.cui, denumire: f.denumire, adresa: f.adresa,
-          judet: f.judet, stare: f.statusInactivi === 0 ? 'ACTIV' : 'INACTIV'
-        }));
+        const results = (json.found || []).map(f => {
+          const dg = f.date_generale || {};
+          const adr = f.adresa_sediu_social || {};
+          const st = f.stare_inactiv || {};
+          return {
+            cui: dg.cui, 
+            denumire: dg.denumire, 
+            adresa: dg.adresa,
+            judet: adr.sdenumire_Judet || '', 
+            stare: st.statusInactivi === false ? 'ACTIV' : 'INACTIV'
+          };
+        });
         cacheSet(cKey, results, 600_000);
         return res.json({ source: 'anaf', data: results });
       }
