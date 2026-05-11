@@ -325,14 +325,45 @@ function normalizeMFinante(j) {
 function parseIndicatori(items) {
   const m = {};
   items.forEach(i => { m[i.indicator] = parseFloat(i.val_indicator) || 0; });
+  // Mapare corectă ANAF bilanț (societăți comerciale):
+  // I1  = Active imobilizate
+  // I2  = Active circulante totale
+  // I3  = Cheltuieli în avans
+  // I4  = Datorii pe termen scurt (< 1 an)
+  // I5  = Active circulante nete / Datorii curente nete
+  // I6  = Total active minus datorii curente
+  // I7  = Total active
+  // I8  = Datorii pe termen lung (> 1 an)
+  // I9  = Provizioane
+  // I10 = Venituri în avans
+  // I11 = Capital subscris vărsat
+  // I12 = Patrimoniul regiei
+  // I13 = Cifra de afaceri netă
+  // I14 = Venituri totale
+  // I15 = Cheltuieli totale
+  // I16 = Profit / Pierdere netă
+  // I17 = Profitul sau pierderea din exploatare
+  // I18 = Capitaluri proprii
+  // I19 = Capital social
+  // I20 = Număr mediu salariați
   return {
-    cifraAfaceri: m['I2'] || 0, profitNet: m['I13'] || 0,
-    totalActive: m['I1'] || 0, capitalPropriu: m['I10'] || 0,
-    datoriiTotale: m['I6'] || 0, nrAngajati: m['I17'] || 0,
-    activeCirculante: m['I3'] || 0, datoriiCurente: m['I8'] || 0,
-    stocuri: m['I4'] || 0, creante: m['I5'] || 0,
-    casaConturi: m['I7'] || 0, venituriTotale: m['I11'] || 0,
-    cheltuieliTotale: m['I12'] || 0,
+    cifraAfaceri: m['I13'] || 0,
+    profitNet: m['I16'] || 0,
+    totalActive: m['I7'] || 0,
+    capitalPropriu: m['I18'] || 0,
+    datoriiTotale: (m['I4'] || 0) + (m['I8'] || 0),
+    nrAngajati: m['I20'] || 0,
+    activeImobilizate: m['I1'] || 0,
+    activeCirculante: m['I2'] || 0,
+    datoriiCurente: m['I4'] || 0,
+    datoriiTermenLung: m['I8'] || 0,
+    stocuri: 0,
+    creante: 0,
+    casaConturi: 0,
+    venituriTotale: m['I14'] || 0,
+    cheltuieliTotale: m['I15'] || 0,
+    profitExploatare: m['I17'] || 0,
+    capitalSocial: m['I19'] || 0,
   };
 }
 
