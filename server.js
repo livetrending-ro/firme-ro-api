@@ -602,12 +602,21 @@ app.get('/api/bvb/instrument/:symbol', async (req, res) => {
     // Parse key values from HTML using regex (BVB uses server-rendered pages)
     const extract = (pattern) => {
       const m = html.match(pattern);
-      return m ? m[1].trim().replace(/,/g, '').replace(/\s/g, '') : null;
+      return m ? m[1].trim().replace(/\s+/g, '') : null;
     };
 
     const parseNum = (val) => {
       if (!val) return 0;
-      return parseFloat(val.replace(/[^\d.\-]/g, '')) || 0;
+      // Romanian format: 1.234,56 → replace dot thousand sep, comma decimal sep
+      let cleaned = val.replace(/\s/g, '');
+      // If has both dot and comma: e.g. "1.234,56" → remove dots, replace comma with dot
+      if (cleaned.includes('.') && cleaned.includes(',')) {
+        cleaned = cleaned.replace(/\./g, '').replace(',', '.');
+      } else if (cleaned.includes(',')) {
+        // Only comma: "38,16" → "38.16"
+        cleaned = cleaned.replace(',', '.');
+      }
+      return parseFloat(cleaned.replace(/[^\d.\-]/g, '')) || 0;
     };
 
     // BVB page structure — extract data from typical patterns
