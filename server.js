@@ -96,6 +96,12 @@ app.get('/api/firma/:cui', async (req, res) => {
     });
     if (r.ok) {
       const json = await r.json();
+      
+      // Dacă CUI-ul a fost validat ca inexistent de ANAF
+      if (json?.notFound?.includes(parseInt(cui))) {
+        return res.status(404).json({ error: 'Firma nu a fost găsită în baza de date ANAF.' });
+      }
+
       const f = json?.found?.[0];
       if (f && f.date_generale && f.date_generale.cui) {
         const mapped = {
